@@ -105,6 +105,8 @@ struct TournamentSetupView: View {
     @State private var editingChipID: UUID? = nil
     @State private var showFollowUpNote = false
     @State private var calculationSnapshot: CalculationSnapshot? = nil
+    @State private var presentedCalculationSnapshot: CalculationSnapshot? = nil
+    @State private var allocationErrorMessage: String? = nil
     @State private var isCalculating = false
     @FocusState private var focusedField: Field?
 
@@ -275,9 +277,9 @@ struct TournamentSetupView: View {
             messages.append("Enter a valid buy-in amount greater than $0.00.")
         }
 
-        let duplicateColors = Dictionary(grouping: chips.map(\.colorName), by: { $0 })
+        let duplicateColors = Dictionary(grouping: chips, by: { normalizedColorName($0.colorName) })
             .filter { $0.value.count > 1 }
-            .map(\.key)
+            .map { $0.value.first?.colorName ?? $0.key }
             .sorted()
 
         if !duplicateColors.isEmpty {
@@ -362,7 +364,7 @@ struct TournamentSetupView: View {
                 applyChipSet(savedRows)
             }
         }
-        .sheet(item: $calculationSnapshot) { snapshot in
+        .sheet(item: $presentedCalculationSnapshot) { snapshot in
             TournamentResultsSheetView(
                 blindSpeed: blindSpeed.rawValue,
                 buyInCents: snapshot.buyInCents,
@@ -432,6 +434,21 @@ struct TournamentSetupView: View {
             Button("OK", role: .cancel) { }
         } message: {
             Text("We saved this tournament setup. PokerStack Plus reminders will be available in a future update.")
+        }
+        .alert(
+            "No Tournament Plan Found",
+            isPresented: Binding(
+                get: { allocationErrorMessage != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        allocationErrorMessage = nil
+                    }
+                }
+            )
+        ) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(allocationErrorMessage ?? "")
         }
     }
 
@@ -822,6 +839,10 @@ struct TournamentSetupView: View {
         return Money.format(cents: cents).replacingOccurrences(of: "$", with: "")
     }
 
+    private func normalizedColorName(_ colorName: String) -> String {
+        colorName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
     fileprivate static func payoutPercentages(forEntrants entrants: Int) -> [Int] {
         switch entrants {
         case 0...2:
@@ -860,28 +881,44 @@ struct TournamentSetupView: View {
         }
 
         let remappedChips = chips.map { remappedByID[$0.id] ?? $0 }
+        let countsByDenomination = Dictionary(
+            uniqueKeysWithValues: allocation.perPlayer.map { ($0.key.denominationCents, $0.value) }
+        )
+        let bankLeftByDenomination = Dictionary(
+            uniqueKeysWithValues: allocation.bankLeft.map { ($0.key.denominationCents, $0.value) }
+        )
         let remappedPerPlayer = Dictionary(
-            uniqueKeysWithValues: allocation.perPlayer.map { item in
-                ((remappedByID[item.key.id] ?? item.key), item.value)
+            uniqueKeysWithValues: remappedChips.compactMap { chip -> (ChipType, Int)? in
+                guard chip.quantity > 0 else { return nil }
+                guard let count = countsByDenomination[chip.denominationCents], count > 0 else { return nil }
+                return (chip, count)
             }
         )
         let remappedBankLeft = Dictionary(
-            uniqueKeysWithValues: allocation.bankLeft.map { item in
-                ((remappedByID[item.key.id] ?? item.key), item.value)
+            uniqueKeysWithValues: remappedChips.compactMap { chip -> (ChipType, Int)? in
+                guard chip.quantity > 0 else { return nil }
+                guard let count = bankLeftByDenomination[chip.denominationCents] else { return nil }
+                return (chip, count)
             }
         )
+        let remappedPerPlayerTotal = remappedPerPlayer.reduce(0) { partial, item in
+            partial + (item.key.denominationCents * item.value)
+        }
+        let remappedReserveBankTotal = remappedBankLeft.reduce(0) { partial, item in
+            partial + (item.key.denominationCents * item.value)
+        }
 
         let remappedAllocation = AllocationResult(
             perPlayer: remappedPerPlayer,
             bankLeft: remappedBankLeft,
-            perPlayerTotalCents: allocation.perPlayerTotalCents,
+            perPlayerTotalCents: remappedPerPlayerTotal,
             feasible: allocation.feasible,
             message: allocation.message,
             score: allocation.score,
             totalChipsPerPlayer: allocation.totalChipsPerPlayer,
             lowChipCountPerPlayer: allocation.lowChipCountPerPlayer,
             blindPostsPossible: allocation.blindPostsPossible,
-            reserveBankTotalCents: allocation.reserveBankTotalCents,
+            reserveBankTotalCents: remappedReserveBankTotal,
             maxSingleColorCountPerPlayer: allocation.maxSingleColorCountPerPlayer,
             colorsOverPreferredCapCount: allocation.colorsOverPreferredCapCount
         )
@@ -913,7 +950,7 @@ struct TournamentSetupView: View {
         let currentChips = activeChips
 
         let ranked = await Task.detached(priority: .userInitiated) { () -> RankedAllocationResult in
-            await ChipAllocator.rankedAuto(
+            ChipAllocator.rankedAuto(
                 chips: currentChips,
                 players: currentPlayers,
                 buyInCents: currentStartingStackUnits,
@@ -928,13 +965,22 @@ struct TournamentSetupView: View {
             allocation: ranked.primaryAllocation
         )
 
+        guard remappedResult.allocation.feasible else {
+            allocationErrorMessage = remappedResult.allocation.message
+            calculationSnapshot = nil
+            presentedCalculationSnapshot = nil
+            saveCurrentSetup()
+            isCalculating = false
+            return
+        }
+
         let calculatedChips = remappedResult.allocation.perPlayer.keys.sorted { $0.denominationCents > $1.denominationCents }
 
         let mappedChips = chips.map { chip in
             remappedResult.chips.first(where: { $0.id == chip.id }) ?? chip
         }
         chips = mappedChips
-        calculationSnapshot = CalculationSnapshot(
+        let snapshot = CalculationSnapshot(
             allocation: remappedResult.allocation,
             chips: calculatedChips,
             buyInCents: currentBuyInCents,
@@ -949,6 +995,8 @@ struct TournamentSetupView: View {
             plannedAddOns: plannedAddOns,
             addOnValueTexts: parsedAddOnValueTexts
         )
+        calculationSnapshot = snapshot
+        presentedCalculationSnapshot = snapshot
 
         saveCurrentSetup()
         isCalculating = false
@@ -956,6 +1004,8 @@ struct TournamentSetupView: View {
 
     private func handleSetupChange() {
         calculationSnapshot = nil
+        presentedCalculationSnapshot = nil
+        allocationErrorMessage = nil
         saveCurrentSetup()
     }
 
@@ -995,7 +1045,7 @@ struct TournamentSetupView: View {
             plannedLateRegistrations: plannedLateRegistrations,
             plannedRebuys: plannedRebuys,
             plannedAddOns: plannedAddOns,
-            addOnValueTexts: addOnValues.map(\.text),
+            addOnValueTexts: parsedAddOnValueTexts,
             blindSpeedRawValue: blindSpeed.rawValue,
             chips: currentSavedChipRows
         )
@@ -1033,6 +1083,11 @@ private struct TournamentResultsSheetView: View {
         let percentage: Int
     }
 
+    private struct AddedAddOn {
+        let moneyCents: Int
+        let chipCounts: [ChipType: Int]
+    }
+
     @Environment(\.dismiss) private var dismiss
 
     let blindSpeed: String
@@ -1052,7 +1107,7 @@ private struct TournamentResultsSheetView: View {
 
     @State private var extraPlayers = 0
     @State private var extraRebuys = 0
-    @State private var addedAddOns: [(moneyCents: Int, chipUnits: Int)] = []
+    @State private var addedAddOns: [AddedAddOn] = []
     @State private var showNegativeBankAlert = false
     @State private var showAddOnSheet = false
     @State private var showAddOnResultAlert = false
@@ -1075,7 +1130,7 @@ private struct TournamentResultsSheetView: View {
     }
 
     private var adjustedBankLeftUnits: Int {
-        allocation.reserveBankTotalCents - ((extraPlayers + extraRebuys) * allocation.perPlayerTotalCents) - extraAddOnChipUnits
+        bankTotal(remainingBank)
     }
 
     private var parsedAddOnOptions: [Int] {
@@ -1090,8 +1145,22 @@ private struct TournamentResultsSheetView: View {
         addedAddOns.reduce(0) { $0 + $1.moneyCents }
     }
 
-    private var extraAddOnChipUnits: Int {
-        addedAddOns.reduce(0) { $0 + $1.chipUnits }
+    private var extraFullStacks: Int {
+        extraPlayers + extraRebuys
+    }
+
+    private var remainingBank: [ChipType: Int] {
+        var bank = allocation.bankLeft
+
+        for _ in 0..<extraFullStacks {
+            subtract(counts: allocation.perPlayer, from: &bank)
+        }
+
+        for addOn in addedAddOns {
+            subtract(counts: addOn.chipCounts, from: &bank)
+        }
+
+        return bank
     }
 
     private var canRemovePlayer: Bool {
@@ -1107,7 +1176,7 @@ private struct TournamentResultsSheetView: View {
     }
 
     private var canAddAnotherFullStack: Bool {
-        adjustedBankLeftUnits - allocation.perPlayerTotalCents >= 0
+        canApply(counts: allocation.perPlayer, to: remainingBank)
     }
 
     private var adjustedPrizeBreakdown: [ResultsPrizePayout] {
@@ -1488,15 +1557,28 @@ private struct TournamentResultsSheetView: View {
         value.formatted(.number.grouping(.automatic))
     }
 
+    private func bankTotal(_ bank: [ChipType: Int]) -> Int {
+        bank.reduce(0) { partial, item in
+            partial + (item.key.denominationCents * item.value)
+        }
+    }
+
+    private func canApply(counts: [ChipType: Int], to bank: [ChipType: Int]) -> Bool {
+        counts.allSatisfy { chip, count in
+            count <= bank[chip, default: 0]
+        }
+    }
+
+    private func subtract(counts: [ChipType: Int], from bank: inout [ChipType: Int]) {
+        for (chip, count) in counts {
+            bank[chip] = max(0, bank[chip, default: 0] - count)
+        }
+    }
+
     private func handleAddOnSelection(_ selectedText: String) {
         guard let selectedCents = Money.cents(from: selectedText), buyInCents > 0 else { return }
 
         let chipUnits = targetChipUnits(for: selectedCents)
-
-        guard adjustedBankLeftUnits - chipUnits >= 0 else {
-            showNegativeBankAlert = true
-            return
-        }
 
         guard let chipBreakdown = addOnBreakdown(for: chipUnits) else {
             addOnResultMessage = "Unable to build an exact add-on stack for \(Money.format(cents: selectedCents)) from the current starting-stack composition."
@@ -1504,7 +1586,8 @@ private struct TournamentResultsSheetView: View {
             return
         }
 
-        addedAddOns.append((moneyCents: selectedCents, chipUnits: chipUnits))
+        let chipCounts = Dictionary(uniqueKeysWithValues: chipBreakdown.map { ($0.chip, $0.count) })
+        addedAddOns.append(AddedAddOn(moneyCents: selectedCents, chipCounts: chipCounts))
 
         let chipLines = chipBreakdown.compactMap { chip, count -> String? in
             guard count > 0 else { return nil }
@@ -1526,15 +1609,21 @@ private struct TournamentResultsSheetView: View {
     }
 
     private func targetChipUnits(for amountCents: Int) -> Int {
-        max(1, Int((Double(allocation.perPlayerTotalCents) * Double(amountCents) / Double(buyInCents)).rounded()))
+        guard allocation.perPlayerTotalCents > 0 else { return 0 }
+        return max(1, Int((Double(allocation.perPlayerTotalCents) * Double(amountCents) / Double(buyInCents)).rounded()))
     }
 
     private func addOnBreakdown(for targetUnits: Int) -> [(chip: ChipType, count: Int)]? {
+        guard targetUnits > 0 else { return nil }
+        let bank = remainingBank
         let available = chips
             .compactMap { chip -> (chip: ChipType, maxCount: Int, idealCount: Double)? in
-                let maxCount = allocation.perPlayer[chip] ?? 0
-                guard maxCount > 0 else { return nil }
-                let idealCount = Double(maxCount) * Double(targetUnits) / Double(allocation.perPlayerTotalCents)
+                let bankCount = bank[chip] ?? 0
+                guard bankCount > 0 else { return nil }
+                let perPlayerCount = allocation.perPlayer[chip] ?? 0
+                guard perPlayerCount > 0 else { return nil }
+                let idealCount = Double(perPlayerCount) * Double(targetUnits) / Double(allocation.perPlayerTotalCents)
+                let maxCount = min(bankCount, max(perPlayerCount, Int(idealCount.rounded(.up))))
                 return (chip: chip, maxCount: maxCount, idealCount: idealCount)
             }
             .sorted { $0.chip.denominationCents > $1.chip.denominationCents }
