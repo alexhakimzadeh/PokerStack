@@ -7,9 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This is an Xcode project — there is no Swift Package Manager manifest. Open and build via:
 
 ```
-open ../PokerHostHelper.xcodeproj
+open ../PokerStack.xcodeproj
 # or
-xcodebuild -project ../PokerHostHelper.xcodeproj -scheme PokerHostHelper -destination 'platform=iOS Simulator,name=iPhone 15'
+xcodebuild -project ../PokerStack.xcodeproj -scheme PokerStack -destination 'platform=iOS Simulator,name=iPhone 15'
 ```
 
 There are no unit or UI test targets. All validation is manual.
